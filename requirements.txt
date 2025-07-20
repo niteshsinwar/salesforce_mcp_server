@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+gunicorn
+pydantic
+pydantic-settings
+python-dotenv
+simple-salesforce
+google-generativeai
+mcp
