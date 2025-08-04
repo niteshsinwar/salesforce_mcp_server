@@ -1,321 +1,879 @@
 import logging
-import inspect
 import requests
-import ast
-from typing import Union
 import json
-import re
+import time
+import zipfile
+import io
 from typing import Optional, Dict, Any, List
-from simple_salesforce.exceptions import (
-    SalesforceResourceNotFound,
-    SalesforceMalformedRequest,
-    SalesforceAuthenticationFailed,
-    SalesforceError
-)
-import pandas as pd
-import ast
-from app.mcp.server import register_tool, add_tool_to_registry, tool_registry
+from lxml import etree
+import base64
+
+from app.mcp.server import register_tool
 from app.services.salesforce import get_salesforce_connection
-sf = get_salesforce_connection()
+
 logger = logging.getLogger(__name__)
 
-# --- Level 1: The Go-To Tools for Standard Operations ---
+# =============================================================================
+# INTERNAL HELPERS – PACKAGE / XML GENERATORS
+# =============================================================================
 
-@register_tool
-def execute_soql_query(query: str) -> str:
-    """
-    Executes a Salesforce Object Query Language (SOQL) query to retrieve data. This is the most reliable and preferred tool for all read-only data retrieval tasks.
+def _generate_package_xml(members: List[str], metadata_type: str, api_version: str) -> str:
+    """Generate a package.xml with one or more members of a single metadata type."""
+    PNS = "http://soap.sforce.com/2006/04/metadata"
+    root = etree.Element(etree.QName(PNS, "Package"), nsmap={None: PNS})
 
-    **WHEN TO USE:**
-    - Use this for any task that involves reading or fetching data from Salesforce.
-    - It is the HIGH-PRIORITY tool for querying because it is safe, efficient, and automatically handles fetching all pages of results.
+    types_tag = etree.SubElement(root, etree.QName(PNS, "types"))
+    for m in members:
+        etree.SubElement(types_tag, etree.QName(PNS, "members")).text = m
+    etree.SubElement(types_tag, etree.QName(PNS, "name")).text = metadata_type
 
-    **GUIDANCE:**
-    - To avoid retrieving too much data, always include a `LIMIT` clause in your query unless you specifically need all records.
-    - Double-check the API names for both the object (e.g., 'Account') and its fields (e.g., 'AnnualRevenue'). Invalid names are a common source of errors.
+    version_tag = etree.SubElement(root, etree.QName(PNS, "version"))
+    version_tag.text = api_version
 
-    Args:
-        query: The complete, valid SOQL query string to execute.
-               Example: "SELECT Id, Name, AnnualRevenue FROM Account WHERE Industry = 'Technology' ORDER BY LastModifiedDate DESC LIMIT 10"
+    return etree.tostring(
+        root, encoding="UTF-8", xml_declaration=True, pretty_print=True
+    ).decode("utf-8")
 
-    Returns:
-        A JSON string of the query results, a success message if no records are found, or a formatted error message.
-    """
-    sf = get_salesforce_connection()
-    if not isinstance(sf, object):
-        return f"❌ Error: Could not establish connection to Salesforce. Details: {sf}"
 
-    logger.info(f"Executing SOQL query: {query}")
-    try:
-        result = sf.query_all(query)
-        records = result.get('records', [])
-        
-        if not records:
-            return "✅ Query executed successfully: No records found."
-        
-        for r in records:
-            r.pop('attributes', None)
-
-        return json.dumps(records, indent=2, default=str)
-    except Exception as e:
-        error_message = f"❌ SOQL Query Error: {e}"
-        logger.error(error_message)
-        if "MALFORMED_QUERY" in str(e):
-            error_message += "\nGUIDANCE: The SOQL query syntax is incorrect. Please check your SELECT statement, object/field names, and WHERE clause."
-        elif "INVALID_FIELD" in str(e):
-            error_message += "\nGUIDANCE: One or more fields in your query are invalid. Verify the API names of the fields for the specified object."
-        return error_message
-
-@register_tool
-def execute_universal_api_request(
-    method: str,
-    sub_endpoint: str,
-    body: Optional[Union[Dict[str, Any], str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
-    api_type: str = "rest",
-    api_version: str = "v59.0",
-    raw_response: bool = False,
-    timeout: int = 30
+def _generate_custom_object_xml(
+    object_label: str,
+    plural_label: str,
+    description: str = "",
+    sharing_model: str = "ReadWrite",
+    deployment_status: str = "Deployed",
 ) -> str:
-    """
-    Enhanced Universal Salesforce API executor supporting ALL Salesforce APIs with intelligent routing,
-    endpoint validation, and comprehensive error handling.
-    
-    **SUPPORTED API TYPES & COMMON ENDPOINTS:**
-    
-    🔹 'rest' (DEFAULT): Standard Salesforce REST API
-       - CRUD operations: sobjects/Account, sobjects/Contact/003xx0000004TmiAAE
-       - Bulk operations: composite/tree/Account, composite/batch, composite/sobjects
-       - Describe: sobjects/Account/describe, sobjects
-       - Queries: query (but prefer execute_soql_query for SOQL)
-       
-    🔹 'tooling': Development & metadata operations
-       - Apex queries: query?q=SELECT Id FROM ApexClass
-       - Debug logs: sobjects/ApexLog
-       - Metadata: sobjects/CustomObject
-       
-    Args:
-        method: HTTP method ('GET', 'POST', 'PATCH', 'DELETE', 'PUT')
-        sub_endpoint: API path after base URL (e.g., 'limits', 'sobjects/Account', 'composite/sobjects')
-        body: Request payload. Can be dict, JSON string, or None
-        params: URL query parameters for GET requests
-        headers: Additional HTTP headers
-        api_type: API type for routing ('rest', 'tooling'). Most endpoints use 'rest'.
-        api_version: Salesforce API version (default: v59.0)
-        raw_response: Return raw response without JSON formatting
-        timeout: Request timeout in seconds (default: 30)
-        
-    Returns:
-        Formatted API response with success/error indicators and actionable guidance
-    """
-    
-    # Input validation
-    if not method or not sub_endpoint:
-        return "❌ Error: 'method' and 'sub_endpoint' are required parameters"
-    
-    sf = get_salesforce_connection()
-    if not isinstance(sf, object):
-        return f"❌ Connection error: {sf}"
+    """Return CustomObject-level XML (no <fields/>)."""
+    PNS = "http://soap.sforce.com/2006/04/metadata"
+    root = etree.Element(etree.QName(PNS, "CustomObject"), nsmap={None: PNS})
 
-    # Parse string body to dict if needed
-    if isinstance(body, str) and body.strip():
-        logger.info("Body provided as string, attempting JSON parsing")
-        try:
-            # Clean common prefixes from tool outputs
-            clean_body = body.strip()
-            if clean_body.startswith('✅'):
-                clean_body = clean_body[1:].strip()
-            
-            body = json.loads(clean_body)
-            logger.info("Successfully parsed string body to JSON")
-        except json.JSONDecodeError as e:
-            return f"❌ JSON Parse Error: Body string is not valid JSON.\nError: {e}\nBody content: {body[:200]}..."
+    etree.SubElement(root, etree.QName(PNS, "label")).text = object_label
+    etree.SubElement(root, etree.QName(PNS, "pluralLabel")).text = plural_label
+    if description:
+        etree.SubElement(root, etree.QName(PNS, "description")).text = description
+    etree.SubElement(root, etree.QName(PNS, "sharingModel")).text = sharing_model
+    etree.SubElement(root, etree.QName(PNS, "deploymentStatus")).text = deployment_status
+    etree.SubElement(root, etree.QName(PNS, "enableActivities")).text = "true"
+    etree.SubElement(root, etree.QName(PNS, "enableReports")).text = "true"
+    etree.SubElement(root, etree.QName(PNS, "enableSearch")).text = "true"
+
+    # Required name field
+    name_field = etree.SubElement(root, etree.QName(PNS, "nameField"))
+    etree.SubElement(name_field, etree.QName(PNS, "label")).text = f"{object_label} Name"
+    etree.SubElement(name_field, etree.QName(PNS, "type")).text = "Text"
+
+    return etree.tostring(
+        root, encoding="UTF-8", xml_declaration=True, pretty_print=True
+    ).decode("utf-8")
+
+
+def _generate_custom_field_xml(field_config: Dict[str, Any]) -> str:
+    """Generate <CustomField> XML for a single field."""
+    PNS = "http://soap.sforce.com/2006/04/metadata"
+    root = etree.Element(etree.QName(PNS, "CustomField"), nsmap={None: PNS})
+
+    # Use just the field name for fullName, not object.field
+    etree.SubElement(root, etree.QName(PNS, "fullName")).text = field_config["fullName"]
+    etree.SubElement(root, etree.QName(PNS, "label")).text = field_config["label"]
+    etree.SubElement(root, etree.QName(PNS, "type")).text = field_config["type"]
+
+    # Length for text fields
+    if field_config["type"] in {"Text", "LongTextArea"} and "length" in field_config:
+        etree.SubElement(root, etree.QName(PNS, "length")).text = str(field_config["length"])
     
-    # Normalize inputs
-    method = method.upper()
-    api_type = api_type.lower()
-    sub_endpoint = sub_endpoint.strip('/')
+    # Precision/scale for number fields
+    if field_config["type"] in {"Number", "Currency", "Percent"}:
+        if "precision" in field_config:
+            etree.SubElement(root, etree.QName(PNS, "precision")).text = str(field_config["precision"])
+        if "scale" in field_config:
+            etree.SubElement(root, etree.QName(PNS, "scale")).text = str(field_config["scale"])
+
+    # Optional properties
+    for tag in ("defaultValue", "description"):
+        if tag in field_config and field_config[tag]:
+            etree.SubElement(root, etree.QName(PNS, tag)).text = str(field_config[tag])
     
-    # Define API base paths and validate api_type
-    api_base_paths = {
-        'rest': f"services/data/{api_version}",
-        'tooling': f"services/data/{api_version}/tooling",
+    # Boolean properties
+    for boolean_tag in ("required", "unique", "externalId"):
+        if boolean_tag in field_config:
+            etree.SubElement(root, etree.QName(PNS, boolean_tag)).text = str(field_config[boolean_tag]).lower()
+
+    # Picklist values
+    if field_config["type"] in {"Picklist", "MultiselectPicklist"} and field_config.get("picklistValues"):
+        value_set = etree.SubElement(root, etree.QName(PNS, "valueSet"))
+        restricted = etree.SubElement(value_set, etree.QName(PNS, "restricted")).text = "true"
+        value_set_def = etree.SubElement(value_set, etree.QName(PNS, "valueSetDefinition"))
+        
+        for pv in field_config["picklistValues"]:
+            value = etree.SubElement(value_set_def, etree.QName(PNS, "value"))
+            etree.SubElement(value, etree.QName(PNS, "fullName")).text = pv["fullName"]
+            etree.SubElement(value, etree.QName(PNS, "label")).text = pv.get("label", pv["fullName"])
+            etree.SubElement(value, etree.QName(PNS, "default")).text = str(pv.get("default", False)).lower()
+
+    # Lookup/Master-Detail relationships
+    if field_config["type"] in {"Lookup", "MasterDetail"} and field_config.get("referenceTo"):
+        etree.SubElement(root, etree.QName(PNS, "referenceTo")).text = field_config["referenceTo"]
+        
+        if "relationshipLabel" in field_config:
+            etree.SubElement(root, etree.QName(PNS, "relationshipLabel")).text = field_config["relationshipLabel"]
+        if "relationshipName" in field_config:
+            etree.SubElement(root, etree.QName(PNS, "relationshipName")).text = field_config["relationshipName"]
+
+    return etree.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True).decode("utf-8")
+
+
+def _generate_lwc_meta_xml(component_name: str, description: str = "", api_version: str = "59.0") -> str:
+    """Generate the .js-meta.xml file for LWC components."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>{api_version}</apiVersion>
+    <isExposed>false</isExposed>
+    <description>{description}</description>
+    <targets>
+        <target>lightning__RecordPage</target>
+        <target>lightning__AppPage</target>
+        <target>lightning__HomePage</target>
+    </targets>
+</LightningComponentBundle>"""
+
+
+# =============================================================================
+# METADATA REST – DEPLOY / POLL
+# =============================================================================
+
+def _execute_metadata_rest_deploy_multipart(
+    sf_connection, zip_buffer: io.BytesIO, check_only: bool = False
+) -> Dict[str, Any]:
+    """Submit a deployment via the REST Metadata endpoint."""
+    endpoint = f"{sf_connection.base_url}metadata/deployRequest"
+    headers = {
+        "Authorization": f"Bearer {sf_connection.session_id}",
+        "Accept": "application/json",
     }
-    
-    if api_type not in api_base_paths:
-        return f"❌ Invalid api_type '{api_type}'. Valid options: {', '.join(api_base_paths.keys())}"
-    
-    # Build full endpoint
-    full_endpoint = f"{api_base_paths[api_type]}/{sub_endpoint}"
-    
-    # Set appropriate headers
-    default_headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
+    deploy_opts = {
+        "checkOnly": check_only,
+        "testLevel": "NoTestRun",
+        "singlePackage": True,
+        "rollbackOnError": True,
     }
-    if headers:
-        default_headers.update(headers)
-    
-    # Log request details
-    logger.info(f"🔄 {api_type.upper()} API Request: {method} {full_endpoint}")
-    if body:
-        logger.info(f"📤 Request body size: {len(json.dumps(body)) if isinstance(body, dict) else len(str(body))} characters")
-    if params:
-        logger.info(f"📋 Query params: {params}")
-    
-    try:
-        # Make the API request
-        response = sf.restful(
-            full_endpoint, 
-            method=method,
-            json=body,
-            params=params,
-            headers=default_headers,
-            timeout=timeout
+    json_part = json.dumps({"deployOptions": deploy_opts})
+    files = {
+        "entity_content": (None, json_part, "application/json"),
+        "file": ("deploymentPackage.zip", zip_buffer.getvalue(), "application/zip"),
+    }
+
+    resp = requests.post(endpoint, headers=headers, files=files, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("id"):
+        raise ValueError("Deploy response missing id")
+    return data
+
+
+def _poll_metadata_rest_deploy_status(
+    sf_connection,
+    async_process_id: str,
+    timeout_seconds: int = 300,
+    interval_seconds: int = 5,
+) -> Dict[str, Any]:
+    """Poll deployRequest/{id} until done or timeout."""
+    endpoint = f"{sf_connection.base_url}metadata/deployRequest/{async_process_id}"
+    headers = {
+        "Authorization": f"Bearer {sf_connection.session_id}",
+        "Accept": "application/json",
+    }
+
+    start = time.time()
+    while True:
+        if time.time() - start > timeout_seconds:
+            return {"success": False, "status": "Timeout"}
+
+        resp = requests.get(endpoint, headers=headers, timeout=45)
+        resp.raise_for_status()
+        result = resp.json().get("deployResult", {})
+        if result.get("done"):
+            return {
+                "success": result["status"] in {"Succeeded", "SucceededPartial"},
+                "status": result["status"],
+                "details": result.get("details"),
+            }
+
+        logger.info(
+            "Deployment %s status: %s (%s/%s components)",
+            async_process_id,
+            result.get("status"),
+            result.get("details", {}).get("numberComponentsDeployed", 0),
+            result.get("details", {}).get("numberComponentsTotal", 0),
         )
-        
-        if raw_response:
-            return str(response)
-        
-        result_str = json.dumps(response, indent=2, default=str)
-        return f"✅ {api_type.upper()} API Success:\n{result_str}"
-        
-    except (SalesforceError, SalesforceMalformedRequest) as e:
-        error_details = e.content if hasattr(e, 'content') else str(e)
-        status_code = getattr(e, 'status', 'Unknown')
-        
-        guidance_map = {
-            400: "Bad Request - Check payload structure and required fields.",
-            404: "Not Found - Verify the endpoint URL is correct and the resource exists.",
-            403: "Forbidden - Check permissions for the object or fields.",
-        }
-        guidance = guidance_map.get(status_code, "An unknown Salesforce API error occurred.")
-        
-        error_msg = (f"❌ {api_type.upper()} API Error ({status_code}): {error_details}\n"
-                     f"📍 Endpoint: {full_endpoint}\n"
-                     f"💡 Guidance: {guidance}")
-        
-        return error_msg
-        
+        time.sleep(interval_seconds)
+
+
+# =============================================================================
+# APEX CLASS TOOLS (ENHANCED WITH CREATE)
+# =============================================================================
+
+@register_tool
+def fetch_apex_class(class_name: str) -> str:
+    """Return full metadata for an Apex class (Tooling API + core fields)."""
+    try:
+        sf = get_salesforce_connection()
+
+        tooling_q = (
+            "SELECT Id, Name, Body, ApiVersion, Status, LengthWithoutComments, "
+            "CreatedDate, CreatedById, LastModifiedDate, LastModifiedById "
+            f"FROM ApexClass WHERE Name = '{class_name}'"
+        )
+        tooling_res = sf.toolingexecute(f"query/?q={tooling_q}")
+        if tooling_res.get("size") == 0:
+            return json.dumps({"success": False, "error": f"{class_name} not found"}, indent=2)
+        apex = tooling_res["records"][0]
+
+        # add CreatedBy / LastModifiedBy names
+        core_q = (
+            "SELECT Id, NamespacePrefix, CreatedBy.Name, LastModifiedBy.Name "
+            f"FROM ApexClass WHERE Name = '{class_name}'"
+        )
+        core_res = sf.query(core_q)
+        if core_res.get("records"):
+            extra = core_res["records"][0]
+            apex["CreatedByName"] = extra["CreatedBy"]["Name"]
+            apex["LastModifiedByName"] = extra["LastModifiedBy"]["Name"]
+            apex["NamespacePrefix"] = extra["NamespacePrefix"]
+
+        apex.pop("attributes", None)
+
+        return json.dumps({"success": True, "data": apex}, indent=2)
+
     except Exception as e:
-        return f"❌ Unexpected Tool Error: {str(e)}\n📍 Context: {method} {full_endpoint}"
+        logger.error("fetch_apex_class: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@register_tool
+def create_apex_class(
+    class_name: str, body: str, api_version: Optional[float] = None, description: str = ""
+) -> str:
+    """Create a new Apex class."""
+    try:
+        sf = get_salesforce_connection()
+        
+        # Check if class already exists
+        check = sf.query(f"SELECT Id FROM ApexClass WHERE Name = '{class_name}'")
+        if check["totalSize"] > 0:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Apex class '{class_name}' already exists. Use upsert_apex_class to update it.",
+                },
+                indent=2,
+            )
+
+        # Validate class name
+        if not class_name.replace("_", "").isalnum():
+            return json.dumps(
+                {"success": False, "error": "Invalid class name. Use only alphanumeric characters and underscores."},
+                indent=2,
+            )
+
+        if api_version is None:
+            api_version = "59.0"
+
+        files = {"apex": body}
+        res = deploy_apex_class_internal(sf, class_name, files, str(api_version))
+        
+        return json.dumps({
+            "success": res.get("success", False),
+            "operation": "create_apex_class",
+            "class_name": class_name,
+            "api_version": api_version,
+            "message": f"Successfully created Apex class '{class_name}'" if res.get("success") else f"Failed to create Apex class '{class_name}'",
+            "job_id": res.get("job_id"),
+            "errors": res.get("details") if not res.get("success") else None
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("create_apex_class: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@register_tool
+def upsert_apex_class(
+    class_name: str, body: str, api_version: Optional[float] = None
+) -> str:
+    """Update an existing Apex class."""
+    try:
+        sf = get_salesforce_connection()
+        check = sf.query(f"SELECT Id, ApiVersion FROM ApexClass WHERE Name = '{class_name}'")
+        if check["totalSize"] == 0:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"{class_name} not found (use create_apex_class to create new classes)",
+                },
+                indent=2,
+            )
+
+        if api_version is None:
+            api_version = check["records"][0]["ApiVersion"]
+
+        files = {"apex": body}
+        res = deploy_apex_class_internal(sf, class_name, files, str(api_version))
+        
+        return json.dumps({
+            "success": res.get("success", False),
+            "operation": "update_apex_class",
+            "class_name": class_name,
+            "api_version": api_version,
+            "message": f"Successfully updated Apex class '{class_name}'" if res.get("success") else f"Failed to update Apex class '{class_name}'",
+            "job_id": res.get("job_id"),
+            "errors": res.get("details") if not res.get("success") else None
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("upsert_apex_class: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+# =============================================================================
+# LWC TOOLS (ENHANCED WITH CREATE)
+# =============================================================================
+
+@register_tool
+def fetch_lwc_component_safe(component_name: str) -> str:
+    """Fetch metadata and source for an LWC component, surviving org schema diffs."""
+    try:
+        sf = get_salesforce_connection()
+
+        # Describe LightningComponentBundle to know optional fields
+        try:
+            describe = sf.toolingexecute("sobjects/LightningComponentBundle/describe/")
+            available = {f["name"] for f in describe.get("fields", [])}
+        except Exception:
+            available = set()
+
+        base = [
+            "Id",
+            "DeveloperName",
+            "NamespacePrefix",
+            "Description",
+            "MasterLabel",
+            "ApiVersion",
+            "IsExposed",
+            "CreatedDate",
+            "CreatedById",
+            "LastModifiedDate",
+            "LastModifiedById",
+        ]
+        optional = [f for f in ("Targets", "TargetConfigs", "LwcResources") if f in available]
+        query_fields = ", ".join(base + optional)
+        bundle_q = (
+            f"SELECT {query_fields} FROM LightningComponentBundle "
+            f"WHERE DeveloperName = '{component_name}' LIMIT 1"
+        )
+
+        bundle_res = sf.toolingexecute(f"query/?q={bundle_q}")
+        if bundle_res.get("size") == 0:
+            return json.dumps({"success": False, "error": "Component not found"}, indent=2)
+        bundle = bundle_res["records"][0]
+        bundle_id = bundle["Id"]
+
+        # Resources
+        res_q = (
+            "SELECT Id, FilePath, Format, Source, CreatedDate, LastModifiedDate "
+            f"FROM LightningComponentResource WHERE LightningComponentBundleId = '{bundle_id}'"
+        )
+        res = sf.toolingexecute(f"query/?q={res_q}")
+
+        files = {}
+        for r in res.get("records", []):
+            path = r["FilePath"]
+            source = r["Source"]
+            name = path.split("/")[-1]
+            ext = name.split(".")[-1].lower()
+            if ext == "html":
+                files["html"] = source
+            elif ext == "js" and not name.endswith(".js-meta.xml"):
+                files["js"] = source
+            elif name.endswith(".js-meta.xml"):
+                files["xml"] = source
+            elif ext == "css":
+                files["css"] = source
+            elif ext == "svg":
+                files["svg"] = source
+            else:
+                files[name] = source
+
+        bundle.pop("attributes", None)
+        return json.dumps(
+            {"success": True, "bundle": bundle, "files": files},
+            indent=2,
+        )
+
+    except Exception as e:
+        logger.error("fetch_lwc_component_safe: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@register_tool
+def create_lwc_component(
+    component_name: str, 
+    html_content: str = "", 
+    js_content: str = "", 
+    css_content: str = "",
+    description: str = "",
+    api_version: Optional[str] = None
+) -> str:
+    """Create a new Lightning Web Component with basic template files."""
+    try:
+        sf = get_salesforce_connection()
+        
+        # 🔧 FIX: Use Tooling API for existence check instead of regular query
+        try:
+            tooling_query = f"SELECT Id FROM LightningComponentBundle WHERE DeveloperName = '{component_name}'"
+            exists = sf.toolingexecute(f'query/?q={tooling_query}')
+            if exists.get("size", 0) > 0:
+                return json.dumps(
+                    {"success": False, "error": f"LWC component '{component_name}' already exists. Use upsert_lwc_component to update it."},
+                    indent=2
+                )
+        except Exception as tooling_error:
+            # If Tooling API also fails, proceed with deployment (let Salesforce handle duplicates)
+            logger.warning(f"Tooling API check failed: {tooling_error}. Proceeding with deployment.")
+
+        # Validate component name
+        if not component_name.replace("_", "").replace("-", "").isalnum():
+            return json.dumps(
+                {"success": False, "error": "Invalid component name. Use only alphanumeric characters, underscores, and hyphens."},
+                indent=2
+            )
+
+        if api_version is None:
+            api_version = getattr(sf, "sf_version", "59.0")
+
+        # Generate default files if not provided
+        if not html_content:
+            html_content = f"""<template>
+    <div class="{component_name}">
+        <h1>Hello from {component_name}!</h1>
+        <p>This is a new Lightning Web Component.</p>
+    </div>
+</template>"""
+
+        if not js_content:
+            js_content = f"""import {{ LightningElement }} from 'lwc';
+
+export default class {component_name.capitalize()} extends LightningElement {{
+    // Component logic goes here
+}}"""
+
+        # Generate meta XML
+        xml_content = _generate_lwc_meta_xml(component_name, description, api_version)
+
+        files = {
+            "html": html_content,
+            "js": js_content,
+            "xml": xml_content
+        }
+        
+        if css_content:
+            files["css"] = css_content
+
+        res = deploy_lwc_component_internal(sf, component_name, files)
+        
+        return json.dumps({
+            "success": res.get("success", False),
+            "operation": "create_lwc_component",
+            "component_name": component_name,
+            "api_version": api_version,
+            "files_created": list(files.keys()),
+            "message": f"Successfully created LWC component '{component_name}'" if res.get("success") else f"Failed to create LWC component '{component_name}'",
+            "job_id": res.get("job_id"),
+            "errors": res.get("details") if not res.get("success") else None
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("create_lwc_component: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 
 
 @register_tool
-def create_python_tool_for_salesforce(function_code: str) -> str:
-    """
-    **POWERFUL META-TOOL:** Dynamically writes, defines, and registers a new Python function as a tool to perform complex, multi-step, or custom tasks.
-
-    **SECURITY WARNING:** This tool executes generated Python code. The code must be safe, efficient, and strictly adhere to the rules below.
-
-    **WHEN TO USE:**
-    - For **multi-step processes**, such as querying for data, processing it, and then updating other records.
-    - For **bulk operations**, like updating or deleting thousands of records based on specific criteria.
-    - For tasks requiring **custom logic** or data manipulation that cannot be done with a single API call.
-    - For tasks that benefit from using the **Pandas library** for data transformation.
-
-    **RULES FOR CODE GENERATION:**
-    1.  **Function Signature:** The code MUST define a single Python function with a unique name, full type hints for all arguments (e.g., `arg_name: str`), and a `-> str` return annotation.
-    2.  **Error Handling:** The entire logic inside the function MUST be wrapped in a single `try...except Exception as e:` block to catch all potential errors.
-    3.  **Return Value:** The function MUST return a descriptive string. This string **MUST** be prefixed with "✅ " for success or "❌ " for failure.
-    4.  **Salesforce Connection:** The first line inside the `try` block MUST be `sf = get_salesforce_connection()` followed by a check to ensure the connection is valid.
-
-    **AVAILABLE LIBRARIES:**
-    The following modules are pre-imported and available in the function's scope. **DO NOT** write `import` statements for these in your generated code.
-    - `json`: For working with JSON data.
-    - `pandas as pd`: For powerful data manipulation.
-    - `get_salesforce_connection`: Function to get the Salesforce connection object.
-    - `date`, `datetime`, `timedelta`: For all date and time operations.
-
-    **--- GENERIC USAGE EXAMPLE ---**
-    This example shows a flexible tool that finds recently modified records for any given Salesforce object.
-    '''python
-    def find_recent_records(object_name: str, days_ago: int) -> str:
-        \"\"\"
-        Finds records of a given SObject type modified in the last N days.
-
-        Args:
-            object_name: The API name of the Salesforce object (e.g., 'Account', 'Lead').
-            days_ago: The number of days to look back for modifications.
-
-        Returns:
-            A JSON string of the records found, or an error message.
-        \"\"\"
-        try:
-            sf = get_salesforce_connection()
-            if not isinstance(sf, object):
-                return f"❌ Error: Could not connect to Salesforce: {sf}"
-
-            # 'date' and 'timedelta' are pre-imported and ready to use.
-            target_date = (date.today() - timedelta(days=days_ago)).isoformat()
-            
-            # This demonstrates dynamically building a query from arguments.
-            query = f"SELECT Id, Name, LastModifiedDate FROM {object_name} WHERE LastModifiedDate >= {target_date} ORDER BY LastModifiedDate DESC"
-            
-            results = sf.query_all(query)
-            records = results.get('records', [])
-            
-            if not records:
-                return "✅ Query successful: No records found matching the criteria."
-
-            for r in records:
-                r.pop('attributes', None)
-
-            # 'json' is pre-imported and ready to use.
-            return f"✅ {json.dumps(records, indent=2)}"
-        except Exception as e:
-            return f"❌ An error occurred while querying {object_name} records: {e}"
-    '''
-    """
-    # The implementation of the function remains the same as the corrected version from the previous turn.
-    logger.warning("--- [SECURITY WARNING] Executing dynamic code from create_python_tool_for_salesforce ---")
-    
-    execution_globals = {
-        "__builtins__": __builtins__,
-        "requests": requests,
-        "json": json,
-        "logging": logging,
-        "get_salesforce_connection": get_salesforce_connection,
-        "pd": pd,
-        "date": __import__('datetime').date,
-        "datetime": __import__('datetime').datetime,
-        "timedelta": __import__('datetime').timedelta,
-    }
-    local_scope = {}
-    
+def upsert_lwc_component(component_name: str, files: Dict[str, str]) -> str:
+    """Update an existing LWC component."""
     try:
-        exec(function_code, execution_globals, local_scope)
-        new_func_name = next((key for key, val in local_scope.items() if inspect.isfunction(val)), None)
+        sf = get_salesforce_connection()
         
-        if not new_func_name:
-            raise ValueError("No function was defined in the provided code string.")
-        
-        new_func = local_scope[new_func_name]
-        add_tool_to_registry(new_func)
-        
-        if new_func_name not in tool_registry:
-            raise ValueError(f"Tool '{new_func_name}' was not successfully registered in tool_registry.")
-        
-        success_message = f"✅ Successfully defined and registered new tool: '{new_func_name}'. You may now call this tool to complete the task."
-        logger.info(success_message)
-        return success_message
+        # 🔧 FIX: Use Tooling API for existence check with fallback
+        try:
+            tooling_query = f"SELECT Id FROM LightningComponentBundle WHERE DeveloperName = '{component_name}'"
+            exists = sf.toolingexecute(f'query/?q={tooling_query}')
+            if exists.get("size", 0) == 0:
+                return json.dumps(
+                    {"success": False, "error": "Component not found (use create_lwc_component to create new components)"}, 
+                    indent=2
+                )
+        except Exception as tooling_error:
+            # If Tooling API also fails, proceed with deployment
+            logger.warning(f"Tooling API check failed: {tooling_error}. Proceeding with update.")
 
-    except SyntaxError as se:
-        error_message = (
-            f"❌ Syntax Error in generated code at line {se.lineno}: {se.msg}\n"
-            f"Code snippet: {se.text.strip() if se.text else 'N/A'}\n"
-            f"GUIDANCE: Check the syntax of your Python code. Ensure proper indentation and valid Python syntax."
-        )
-        logger.error(error_message, exc_info=True)
-        return error_message
+        # Validate required files
+        for req in ("html", "js", "xml"):
+            if req not in files:
+                return json.dumps(
+                    {"success": False, "error": f"Missing required file: {req}"}, indent=2
+                )
+
+        res = deploy_lwc_component_internal(sf, component_name, files)
+        
+        return json.dumps({
+            "success": res.get("success", False),
+            "operation": "update_lwc_component",
+            "component_name": component_name,
+            "files_updated": list(files.keys()),
+            "message": f"Successfully updated LWC component '{component_name}'" if res.get("success") else f"Failed to update LWC component '{component_name}'",
+            "job_id": res.get("job_id"),
+            "errors": res.get("details") if not res.get("success") else None
+        }, indent=2)
+
     except Exception as e:
-        error_message = (
-            f"❌ Failed to define the new tool. Error: {e}\n"
-            f"Full code:\n{function_code}\n"
-            "GUIDANCE: Ensure the code defines a single function with a docstring, uses allowed imports (json, get_salesforce_connection), "
-            "starts with a Salesforce connection check, and includes a try/except block."
+        logger.error("upsert_lwc_component: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+
+# =============================================================================
+# CUSTOM OBJECT TOOLS
+# =============================================================================
+
+@register_tool
+def fetch_object_metadata(object_name: str) -> str:
+    """Return describe() + record type info for any object."""
+    try:
+        sf = get_salesforce_connection()
+        desc = getattr(sf, object_name).describe()
+    except Exception:
+        return json.dumps({"success": False, "error": f"{object_name} not found"}, indent=2)
+
+    fields = []
+    for f in desc["fields"]:
+        fd = {
+            "name": f["name"],
+            "label": f["label"],
+            "type": f["type"],
+            "required": not f.get("nillable", True),
+            "custom": f.get("custom", False),
+        }
+        if f["type"] in {"text", "textarea"}:
+            fd["length"] = f.get("length")
+        if f["type"] == "number":
+            fd["precision"] = f.get("precision")
+            fd["scale"] = f.get("scale")
+        if f["type"] == "reference":
+            fd["referenceTo"] = f.get("referenceTo", [])
+            fd["relationshipName"] = f.get("relationshipName")
+        fields.append(fd)
+
+    record_types = []
+    try:
+        rts = sf.query(
+            f"SELECT Id, Name, DeveloperName, IsActive FROM RecordType WHERE SobjectType = '{object_name}'"
         )
-        logger.error(error_message, exc_info=True)
-        return error_message
+        record_types = [
+            {
+                "id": rt["Id"],
+                "name": rt["Name"],
+                "developerName": rt["DeveloperName"],
+                "isActive": rt["IsActive"],
+            }
+            for rt in rts.get("records", [])
+        ]
+    except Exception:
+        pass
+
+    return json.dumps(
+        {
+            "success": True,
+            "objectName": object_name,
+            "label": desc["label"],
+            "isCustom": desc["custom"],
+            "totalFields": len(fields),
+            "fields": fields,
+            "recordTypes": record_types,
+        },
+        indent=2,
+    )
+
+
+@register_tool
+def upsert_custom_object(
+    object_name: str,
+    label: str,
+    plural_label: str,
+    description: str = "",
+    sharing_model: str = "ReadWrite",
+) -> str:
+    """Create or update a custom object (simple implementation)."""
+    try:
+        sf = get_salesforce_connection()
+        if not object_name.endswith("__c"):
+            object_name += "__c"
+        if not object_name[:-3].replace("_", "").isalnum():
+            return json.dumps(
+                {"success": False, "error": "Invalid object name"}, indent=2
+            )
+
+        # Build the XML
+        custom_object_xml = _generate_custom_object_xml(
+            label, plural_label, description, sharing_model
+        )
+
+        api_ver = getattr(sf, "sf_version", "59.0")
+        pkg_xml = _generate_package_xml([object_name], "CustomObject", api_ver)
+
+        # Zip
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("package.xml", pkg_xml)
+            z.writestr(f"objects/{object_name}.object", custom_object_xml)
+        buf.seek(0)
+
+        dep = _execute_metadata_rest_deploy_multipart(sf, buf)
+        status = _poll_metadata_rest_deploy_status(sf, dep["id"])
+
+        return json.dumps(
+            {
+                "success": status["success"],
+                "job_id": dep["id"],
+                "status": status["status"],
+                "details": status.get("details"),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("upsert_custom_object: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+# =============================================================================
+# CUSTOM FIELD TOOLS
+# =============================================================================
+
+@register_tool
+def fetch_custom_field(object_name: str, field_name: str) -> str:
+    """Fetch describe info + Tooling metadata for one field."""
+    try:
+        sf = get_salesforce_connection()
+
+        desc = getattr(sf, object_name).describe()
+        field = next((f for f in desc["fields"] if f["name"] == field_name), None)
+        if not field:
+            return json.dumps({"success": False, "error": "Field not found"}, indent=2)
+
+        tooling_q = (
+            "SELECT Id, DurableId, DataType, Precision, Scale, Length "
+            f"FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = '{object_name}' "
+            f"AND QualifiedApiName = '{field_name}'"
+        )
+        tooling_res = sf.toolingexecute(f"query/?q={tooling_q}")
+        extra = tooling_res["records"][0] if tooling_res.get("records") else {}
+
+        field.pop("attributes", None)
+        return json.dumps({"success": True, "field": field, "extra": extra}, indent=2)
+
+    except Exception as e:
+        logger.error("fetch_custom_field: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@register_tool
+def upsert_custom_field(object_name: str, field_config: Dict[str, Any]) -> str:
+    """Create a new custom field via Metadata REST."""
+    try:
+        sf = get_salesforce_connection()
+
+        # Ensure proper object naming
+        if not object_name.endswith("__c") and object_name not in {
+            "Account", "Contact", "Lead", "Opportunity", "Case"
+        }:
+            object_name += "__c"
+
+        # Get field name and ensure proper naming
+        field_name = field_config["name"]
+        if not field_name.endswith("__c"):
+            field_name += "__c"
+        
+        # Validate field name
+        if not field_name[:-3].replace("_", "").isalnum():
+            return json.dumps({"success": False, "error": "Invalid field name"}, indent=2)
+
+        # Set the fullName for XML generation (this is crucial)
+        field_config["fullName"] = field_name  # Just the field name, not object.field
+        field_xml = _generate_custom_field_xml(field_config)
+
+        # Create package.xml with the correct member format
+        api_ver = getattr(sf, "sf_version", "59.0")
+        member_name = f"{object_name}.{field_name}"  # This goes in package.xml
+        pkg_xml = _generate_package_xml([member_name], "CustomField", api_ver)
+
+        # Create deployment package with CORRECT file structure
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("package.xml", pkg_xml)
+            
+            # 🔧 CRITICAL FIX: Use the object folder structure approach
+            z.writestr(f"objects/{object_name}/fields/{field_name}.field", field_xml)
+            
+            # Also create a minimal object definition to ensure object exists in package
+            minimal_object_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fields>
+        <fullName>{field_name}</fullName>
+        <label>{field_config['label']}</label>
+        <type>{field_config['type']}</type>
+        {"<length>" + str(field_config['length']) + "</length>" if 'length' in field_config else ""}
+        {"<required>" + str(field_config.get('required', False)).lower() + "</required>" if 'required' in field_config else ""}
+        {"<description>" + field_config['description'] + "</description>" if 'description' in field_config else ""}
+    </fields>
+</CustomObject>"""
+            z.writestr(f"objects/{object_name}.object", minimal_object_xml)
+        
+        buf.seek(0)
+
+        # Deploy with validation first
+        deploy_result = _execute_metadata_rest_deploy_multipart(sf, buf, check_only=True)
+        validation_status = _poll_metadata_rest_deploy_status(sf, deploy_result["id"])
+        
+        if not validation_status["success"]:
+            return json.dumps({
+                "success": False,
+                "error": "Validation failed",
+                "validation_errors": validation_status.get("details"),
+                "job_id": deploy_result["id"]
+            }, indent=2)
+
+        # If validation passes, do actual deployment
+        buf.seek(0)
+        actual_deploy = _execute_metadata_rest_deploy_multipart(sf, buf, check_only=False)
+        final_status = _poll_metadata_rest_deploy_status(sf, actual_deploy["id"])
+
+        return json.dumps({
+            "success": final_status["success"],
+            "operation": "create_custom_field",
+            "object_name": object_name,
+            "field_name": field_name,
+            "field_type": field_config.get("type"),
+            "job_id": actual_deploy["id"],
+            "message": f"Successfully created field {field_name} on {object_name}" if final_status["success"] else "Field creation failed",
+            "errors": final_status.get("details") if not final_status["success"] else None
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("upsert_custom_field error: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+# =============================================================================
+# SOQL QUERY EXECUTION TOOL
+# =============================================================================
+
+@register_tool
+def execute_soql_query(query: str, use_tooling_api: bool = False) -> str:
+    """Execute any SOQL query and return results in JSON format.
+    
+    Args:
+        query: The SOQL query to execute (e.g., "SELECT Id, Name FROM Account LIMIT 10")
+        use_tooling_api: Set to True for Tooling API queries (for metadata objects like ApexClass, CustomField etc.)
+    
+    Returns:
+        JSON string with query results or error message
+    """
+    try:
+        sf = get_salesforce_connection()
+        
+        # Clean up the query - remove extra whitespace and ensure proper formatting
+        clean_query = ' '.join(query.strip().split())
+        
+        if use_tooling_api:
+            # Use Tooling API for metadata queries
+            result = sf.toolingexecute(f"query/?q={clean_query}")
+        else:
+            # Use standard API for data queries
+            result = sf.query(clean_query)
+        
+        # Clean up the response - remove attributes and format nicely
+        if result.get("records"):
+            for record in result["records"]:
+                record.pop("attributes", None)
+                # Also clean nested objects
+                for key, value in record.items():
+                    if isinstance(value, dict) and "attributes" in value:
+                        value.pop("attributes", None)
+        
+        return json.dumps({
+            "success": True, 
+            "totalSize": result.get("totalSize", 0),
+            "done": result.get("done", True),
+            "records": result.get("records", [])
+        }, indent=2)
+        
+    except Exception as e:
+        logger.error("execute_soql_query error: %s", e, exc_info=True)
+        return json.dumps({
+            "success": False, 
+            "error": str(e),
+            "query": query
+        }, indent=2)
+
+# =============================================================================
+# APEX / LWC DEPLOY INTERNALS
+# =============================================================================
+
+def deploy_apex_class_internal(
+    sf_connection, class_name: str, files_content: Dict[str, str], api_version: str
+) -> Dict[str, Any]:
+    """Deploy Apex class via REST Metadata."""
+    pkg_xml = _generate_package_xml([class_name], "ApexClass", api_version)
+
+    PNS = "http://soap.sforce.com/2006/04/metadata"
+    root = etree.Element(etree.QName(PNS, "ApexClass"), nsmap={None: PNS})
+    etree.SubElement(root, etree.QName(PNS, "apiVersion")).text = str(api_version)
+    etree.SubElement(root, etree.QName(PNS, "status")).text = "Active"
+    meta_xml = etree.tostring(
+        root, encoding="UTF-8", pretty_print=True, xml_declaration=True
+    ).decode()
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("package.xml", pkg_xml)
+        z.writestr(f"classes/{class_name}.cls", files_content["apex"])
+        z.writestr(f"classes/{class_name}.cls-meta.xml", meta_xml)
+    buf.seek(0)
+
+    dep = _execute_metadata_rest_deploy_multipart(sf_connection, buf)
+    status = _poll_metadata_rest_deploy_status(sf_connection, dep["id"])
+    status["job_id"] = dep["id"]
+    return status
+
+
+def deploy_lwc_component_internal(
+    sf_connection, component_name: str, files_content: Dict[str, str]
+) -> Dict[str, Any]:
+    """Deploy an LWC bundle."""
+    api_version = getattr(sf_connection, "sf_version", "59.0")
+    pkg_xml = _generate_package_xml([component_name], "LightningComponentBundle", api_version)
+
+    base = f"lwc/{component_name}/"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("package.xml", pkg_xml)
+        z.writestr(f"{base}{component_name}.html", files_content["html"])
+        z.writestr(f"{base}{component_name}.js", files_content["js"])
+        z.writestr(f"{base}{component_name}.js-meta.xml", files_content["xml"])
+        if files_content.get("css"):
+            z.writestr(f"{base}{component_name}.css", files_content["css"])
+        if files_content.get("svg"):
+            z.writestr(f"{base}{component_name}.svg", files_content["svg"])
+    buf.seek(0)
+
+    dep = _execute_metadata_rest_deploy_multipart(sf_connection, buf)
+    status = _poll_metadata_rest_deploy_status(sf_connection, dep["id"])
+    status["job_id"] = dep["id"]
+    return status
