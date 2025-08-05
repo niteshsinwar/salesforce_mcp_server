@@ -1,29 +1,72 @@
 from simple_salesforce import Salesforce
-from app.core.config import settings
 import threading
+import time
 
-# Use a thread-local storage to ensure the connection is unique per thread
+# Import OAuth functions
+try:
+    from app.mcp.tools.oauth_auth import get_stored_tokens, refresh_salesforce_token
+    OAUTH_AVAILABLE = True
+except ImportError:
+    OAUTH_AVAILABLE = False
+    print("⚠️  OAuth module not available")
+
+# Thread-local storage
 local = threading.local()
 
-def get_salesforce_connection():
+def get_salesforce_connection(user_id: str = None):
     """
-    Establishes and returns a thread-safe Salesforce connection using the
-    Username-Password flow.
-    It reads credentials from the environment settings.
+    Get Salesforce connection using OAuth tokens (no config required).
+    
+    Args:
+        user_id: Specific user ID (optional, uses first available)
+    
+    Returns:
+        Salesforce connection instance
     """
-    if not hasattr(local, 'sf_connection'):
-        print("Creating new Salesforce connection for this thread...")
-        try:
-            # This block now uses the username, password, and security token
-            # for authentication.
-            local.sf_connection = Salesforce(
-                username=settings.SALESFORCE_USERNAME,
-                password=settings.SALESFORCE_PASSWORD,
-                security_token=settings.SALESFORCE_SECURITY_TOKEN,
-                instance_url=settings.SALESFORCE_INSTANCE_URL
+    if not hasattr(local, 'sf_connection') or local.sf_connection is None:
+        print("🔗 Creating Salesforce connection...")
+        
+        if not OAUTH_AVAILABLE:
+            raise Exception("OAuth not available. Please ensure oauth_auth module is imported.")
+        
+        stored_tokens = get_stored_tokens()
+        
+        if not stored_tokens:
+            raise Exception(
+                "❌ No active Salesforce sessions found.\n"
+                "Please run one of these commands first:\n"
+                "- salesforce_quick_login() - for production orgs\n"
+                "- salesforce_sandbox_login() - for sandbox orgs\n"
+                "- salesforce_login_custom_domain('https://yourorg.my.salesforce.com') - for custom domains"
             )
-            print("Salesforce connection successful.")
-        except Exception as e:
-            print(f"FATAL: Salesforce connection failed: {e}")
-            local.sf_connection = None
+        
+        # Select token
+        if user_id and user_id in stored_tokens:
+            token_data = stored_tokens[user_id]
+            selected_user = user_id
+        else:
+            selected_user, token_data = next(iter(stored_tokens.items()))
+        
+        # Check token age and refresh if needed
+        token_age = time.time() - token_data['login_timestamp']
+        if token_age > 5400:  # 90 minutes
+            print(f"🔄 Refreshing token for {selected_user}...")
+            if not refresh_salesforce_token(selected_user):
+                raise Exception(f"Failed to refresh token for {selected_user}. Please login again.")
+            # Get updated token
+            token_data = get_stored_tokens()[selected_user]
+        
+        # Create connection
+        local.sf_connection = Salesforce(
+            instance_url=token_data['instance_url'],
+            session_id=token_data['access_token']
+        )
+        
+        print(f"✅ Connected to {token_data['instance_url']} as user {selected_user}")
+    
     return local.sf_connection
+
+def clear_connection_cache():
+    """Clear connection cache to force new connection"""
+    if hasattr(local, 'sf_connection'):
+        local.sf_connection = None

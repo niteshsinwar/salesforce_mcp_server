@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: salesforce-mcp-server
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -c gunicorn_conf.py app.main:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+    healthCheckPath: /health
+    autoDeploy: true

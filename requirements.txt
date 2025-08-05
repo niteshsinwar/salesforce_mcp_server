@@ -6,4 +6,5 @@ pydantic-settings
 python-dotenv
 simple-salesforce
 google-generativeai
+psutil
 mcp

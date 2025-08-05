@@ -1,23 +1,35 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+"""Configuration management for both local and cloud deployment."""
+import os
+from typing import Optional
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    # Load settings from a .env file
-    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+    # Project info
+    PROJECT_NAME: str = "Salesforce MCP Server"
+    VERSION: str = "1.0.0"
+    
+    # API Configuration
+    API_KEY: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
+    
+    # Salesforce Configuration
+    
+    # Server Configuration
+    PORT: int = 8000
+    DEBUG: bool = True
+    
+    # Environment detection
+    @property
+    def is_local(self) -> bool:
+        return os.getenv("RENDER") is None
+    
+    @property
+    def is_cloud(self) -> bool:
+        return not self.is_local
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
 
-    # Application Settings
-    PROJECT_NAME: str = "Salesforce AI Agent Server"
-
-    # Security: A secret key required to access the server's endpoints
-    API_KEY: str
-
-    # Gemini API
-    GEMINI_API_KEY: str
-
-    # Salesforce Credentials (Username-Password Flow)
-    SALESFORCE_USERNAME: str
-    SALESFORCE_PASSWORD: str
-    SALESFORCE_SECURITY_TOKEN: str
-    SALESFORCE_INSTANCE_URL: str
-
-# Create a single, importable settings instance
+# Global settings instance
 settings = Settings()
