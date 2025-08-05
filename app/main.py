@@ -89,11 +89,6 @@ async def mcp_endpoint(
             headers.get("x-api-key") or
             mcp_api_key
         )
-        
-        expected_key = settings.API_KEY
-        if expected_key and (not api_key or api_key.strip() != expected_key.strip()):
-            logger.warning(f"Unauthorized MCP access from {request.client.host}")
-            raise HTTPException(status_code=401, detail="Invalid API key")
     
     try:
         body = await request.json()
