@@ -56,6 +56,21 @@ def health_check():
         "tools_count": len(tool_registry)
     }
 
+@app.get("/mcp")
+async def mcp_sse():
+    """
+    SSE endpoint for Model-Context-Protocol clients.
+    Sends a keep-alive ping every 15 s.  Replace this with real
+    event data if you later stream tool output.
+    """
+    async def event_gen():
+        while True:
+            yield "data: ping\n\n"        # SSE keep-alive
+            await asyncio.sleep(15)
+
+    return StreamingResponse(event_gen(),
+                             media_type="text/event-stream")
+                             
 # ✅ NEW: MCP HTTP Endpoint (This was missing!)
 @app.post("/mcp")
 async def mcp_endpoint(
