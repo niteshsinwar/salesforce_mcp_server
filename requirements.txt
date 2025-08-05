@@ -8,6 +8,6 @@ simple-salesforce==1.12.4
 google-generativeai==0.3.2
 langchain-google-genai==1.0.8
 psutil==5.9.6
-requests==2.31.0
+requests==2.32.4
 lxml==4.9.3
 mcp==1.0.0
