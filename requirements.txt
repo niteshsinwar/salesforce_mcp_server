@@ -7,4 +7,5 @@ python-dotenv
 simple-salesforce
 google-generativeai
 psutil
+asyncio
 mcp

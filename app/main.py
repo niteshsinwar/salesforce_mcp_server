@@ -1,6 +1,8 @@
 import sys
 import os
 import uvicorn
+import asyncio
+from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
@@ -60,17 +62,16 @@ def health_check():
 async def mcp_sse():
     """
     SSE endpoint for Model-Context-Protocol clients.
-    Sends a keep-alive ping every 15 s.  Replace this with real
-    event data if you later stream tool output.
+    Sends a keep-alive ping every 15 s.
     """
     async def event_gen():
         while True:
-            yield "data: ping\n\n"        # SSE keep-alive
+            yield "data: ping\n\n"          # SSE keep-alive
             await asyncio.sleep(15)
 
     return StreamingResponse(event_gen(),
                              media_type="text/event-stream")
-                             
+
 # ✅ NEW: MCP HTTP Endpoint (This was missing!)
 @app.post("/mcp")
 async def mcp_endpoint(
