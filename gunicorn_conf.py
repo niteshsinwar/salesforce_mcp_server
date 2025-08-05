@@ -1,11 +1,12 @@
 import multiprocessing
 import os
+import platform
 
-# Render uses PORT environment variable (default 10000)
-port = os.getenv("PORT", "10000")
+# Port configuration
+port = os.getenv("PORT", "8000")
 bind = f"0.0.0.0:{port}"
 
-# Optimized worker configuration
+# Worker configuration
 workers = min(multiprocessing.cpu_count() * 2 + 1, 4)
 worker_class = "uvicorn.workers.UvicornWorker"
 
@@ -20,6 +21,12 @@ keepalive = 5
 max_requests = 1000
 max_requests_jitter = 100
 
-# Memory optimization
-preload_app = True
-worker_tmp_dir = "/dev/shm"
+# Platform-specific worker temp directory
+if platform.system() == "Linux":
+    # Use shared memory on Linux (Render, Docker, etc.)
+    worker_tmp_dir = "/dev/shm"
+    preload_app = True
+else:
+    # Use default temp dir on macOS/Windows
+    worker_tmp_dir = None  # Uses system default
+    preload_app = False    # Safer for development
